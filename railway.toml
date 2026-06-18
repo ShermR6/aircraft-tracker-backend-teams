@@ -1,0 +1,5 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python migrate_gs_device_key.py && python migrate_sdr_range.py && python -m uvicorn main:app --host 0.0.0.0 --port $PORT"

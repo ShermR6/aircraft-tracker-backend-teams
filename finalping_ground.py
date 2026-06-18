@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+FinalPing Ground Station v3.0
+─────────────────────────────
+Reads live ADS-B data from dump1090 and pushes positions to the FinalPing cloud.
+Authenticates with a permanent device key (no email/password required).
+
+Data source priority: HTTP JSON API → filesystem aircraft.json → SBS TCP stream (port 30003)
+
+Setup:
+  Token is claimed automatically via the FinalPing_Setup hotspot on first boot.
+  Or set manually: echo '{"token": "YOUR_KEY"}' > /home/pi/finalping-ground/config.json
+"""
+
+import json
+import os
+import socket
+import sys
+import threading
+import time
+import requests
+from datetime import datetime
+from math import radians, cos, sin, asin, sqrt, atan2, degrees
+
+VERSION    = "3.1"
+API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
+UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
+
+DUMP1090_URL = os.environ.get("DUMP1090_URL", "http://localhost:8080/data/aircraft.json")
+SBS_HOST     = os.environ.get("SBS_HOST", "localhost")
+SBS_PORT     = int(os.environ.get("SBS_PORT", "30003"))
+CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+POLL_INTERVAL      = 5
+HEARTBEAT_INTERVAL = 60
+RANGE_PUSH_INTERVAL = 300
+
+DUMP1090_HTTP_URLS = [
+    DUMP1090_URL,
+    "http://localhost:8080/skyaware/data/aircraft.json",
+    "http://localhost/skyaware/data/aircraft.json",
+    "http://localhost:8888/data/aircraft.json",
+    "http://127.0.0.1:8080/data/aircraft.json",
+]
+
+DUMP1090_FILE_PATHS = [
+    "/run/dump1090-fa/aircraft.json",
+    "/run/readsb/aircraft.json",
+    "/run/dump1090/aircraft.json",
+    "/var/run/dump1090-fa/aircraft.json",
+    "/tmp/dump1090-fa/aircraft.json",
+    "/home/pi/dump1090/aircraft.json",
+]
+
+# ── SBS stream state ──────────────────────────────────────────────────────────
+_sbs_aircraft  = {}
+_sbs_lock      = threading.Lock()
+_sbs_connected = False
+
+
+def log(msg):
+    print(f"{datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return 3440.065 * 2 * asin(sqrt(a))
+
+
+def haversine_bearing(lat1, lon1, lat2, lon2):
+    lat1, lat2 = radians(lat1), radians(lat2)
+    dlon = radians(lon2 - lon1)
+    x = sin(dlon) * cos(lat2)
+    y = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dlon)
+    return (degrees(atan2(x, y)) + 360) % 360
+
+
+def load_token():
+    token = os.environ.get("FINALPING_TOKEN")
+    if token:
+        return token
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f).get("token")
+    return None
+
+
+def api_get(endpoint, token):
+    r = requests.get(f"{API_BASE}{endpoint}", headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_post(endpoint, token, body):
+    r = requests.post(f"{API_BASE}{endpoint}", json=body, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+# ── Auto-updater ──────────────────────────────────────────────────────────────
+
+def check_for_update():
+    try:
+        r = requests.get(f"{UPDATE_URL}/version.txt", timeout=5)
+        latest = r.text.strip()
+        if latest == VERSION:
+            return
+        log(f"[UPDATE] v{VERSION} → v{latest} — downloading...")
+        r2 = requests.get(f"{UPDATE_URL}/finalping_ground.py", timeout=30)
+        script_path = os.path.abspath(__file__)
+        tmp_path = script_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write(r2.text)
+        os.replace(tmp_path, script_path)
+        log(f"[UPDATE] Updated to v{latest} — restarting...")
+        os.execv(sys.executable, [sys.executable, script_path] + sys.argv[1:])
+    except Exception as e:
+        log(f"[UPDATE] Check failed: {e}")
+
+
+# ── SBS reader (background thread) ───────────────────────────────────────────
+
+def _parse_sbs_line(line):
+    if not line.startswith("MSG"):
+        return
+    parts = line.split(",")
+    if len(parts) < 16:
+        return
+    msg_type = parts[1].strip()
+    hex_id   = parts[4].strip().lower()
+    if not hex_id:
+        return
+
+    def field(i):
+        return parts[i].strip() if i < len(parts) and parts[i].strip() else None
+
+    with _sbs_lock:
+        if hex_id not in _sbs_aircraft:
+            _sbs_aircraft[hex_id] = {"hex": hex_id}
+        ac = _sbs_aircraft[hex_id]
+        ac["last_seen"] = time.time()
+
+        try:
+            if msg_type == "1":
+                cs = field(10)
+                if cs: ac["flight"] = cs
+
+            elif msg_type == "2":
+                if field(14): ac["lat"] = float(parts[14])
+                if field(15): ac["lon"] = float(parts[15])
+                if field(12): ac["gs"]  = float(parts[12])
+                if field(13): ac["track"] = float(parts[13])
+                ac["alt_baro"] = "ground"
+                ac["on_ground"] = True
+
+            elif msg_type == "3":
+                if field(11): ac["alt_baro"] = int(parts[11])
+                if field(14): ac["lat"] = float(parts[14])
+                if field(15): ac["lon"] = float(parts[15])
+                on_g = field(21) if len(parts) > 21 else None
+                ac["on_ground"] = (on_g == "-1")
+
+            elif msg_type == "4":
+                if field(12): ac["gs"]    = float(parts[12])
+                if field(13): ac["track"] = float(parts[13])
+        except (ValueError, IndexError):
+            pass
+
+
+def _sbs_reader_thread():
+    global _sbs_connected
+    while True:
+        try:
+            with socket.create_connection((SBS_HOST, SBS_PORT), timeout=10) as sock:
+                _sbs_connected = True
+                log(f"[OK] SBS stream connected on port {SBS_PORT}")
+                sock.settimeout(30)
+                buf = ""
+                while True:
+                    chunk = sock.recv(4096).decode("utf-8", errors="replace")
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        _parse_sbs_line(line.strip())
+        except Exception:
+            pass
+        _sbs_connected = False
+        time.sleep(5)
+
+
+def fetch_dump1090():
+    for url in DUMP1090_HTTP_URLS:
+        try:
+            r = requests.get(url, timeout=3)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("aircraft", data.get("ac", []))
+        except Exception:
+            continue
+
+    for path in DUMP1090_FILE_PATHS:
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            return data.get("aircraft", data.get("ac", []))
+
+    if _sbs_connected:
+        cutoff = time.time() - 30
+        with _sbs_lock:
+            return [dict(ac) for ac in _sbs_aircraft.values() if ac.get("last_seen", 0) > cutoff]
+
+    raise RuntimeError("dump1090 not reachable via HTTP, filesystem, or SBS stream")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def run():
+    check_for_update()
+
+    log("=" * 56)
+    log(f"  FinalPing Ground Station v{VERSION}")
+    log("=" * 56)
+
+    token = load_token()
+    if not token:
+        log("[ERR] No token found. Run setup or set FINALPING_TOKEN.")
+        sys.exit(1)
+
+    log("Validating ground station access...")
+    try:
+        api_post("/api/ground/validate", token, {})
+        log("[OK] Ground station access confirmed")
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 403:
+            log("[ERR] Ground station not enabled for this account.")
+        else:
+            log(f"[ERR] Validation failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        log(f"[ERR] Could not reach backend: {e}")
+        sys.exit(1)
+
+    log("Fetching config from backend...")
+    try:
+        config = api_get("/api/ground/config", token)
+    except Exception as e:
+        log(f"[ERR] Failed to fetch config: {e}")
+        sys.exit(1)
+
+    center_lat      = float(config["lat"])
+    center_lon      = float(config["lon"])
+    field_elevation = float(config.get("elevation_ft", 0))
+    tracked = {
+        a["icao24"].lower(): a["tail"]
+        for a in config.get("aircraft", []) if a.get("icao24")
+    }
+
+    log(f"[OK] Location: {center_lat:.4f}, {center_lon:.4f} | Elevation: {field_elevation:.0f}ft MSL")
+    log(f"[OK] Tracking {len(tracked)} aircraft: {', '.join(tracked.values()) or 'none configured'}")
+
+    t = threading.Thread(target=_sbs_reader_thread, daemon=True)
+    t.start()
+
+    source_label = None
+    for u in DUMP1090_HTTP_URLS:
+        try:
+            if requests.get(u, timeout=2).status_code == 200:
+                source_label = u
+                break
+        except Exception:
+            continue
+    if not source_label:
+        source_label = next((p for p in DUMP1090_FILE_PATHS if os.path.exists(p)), None)
+    if not source_label:
+        source_label = f"SBS stream port {SBS_PORT}"
+    log(f"[OK] Dump1090 source: {source_label}")
+    log("Ground station running...")
+
+    range_nm          = [0.0] * 36
+    last_heartbeat    = 0.0
+    last_range_push   = 0.0
+    last_update_check = time.time()
+    last_config_refresh = time.time()
+
+    while True:
+        now = time.time()
+
+        if now - last_update_check >= 3600:
+            check_for_update()
+            last_update_check = now
+
+        if now - last_config_refresh >= 3600:
+            try:
+                config = api_get("/api/ground/config", token)
+                tracked = {
+                    a["icao24"].lower(): a["tail"]
+                    for a in config.get("aircraft", []) if a.get("icao24")
+                }
+                log(f"[OK] Config refreshed — tracking {len(tracked)} aircraft")
+            except Exception as e:
+                log(f"[WARN] Config refresh failed: {e}")
+            last_config_refresh = now
+
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+            try:
+                api_post("/api/ground/heartbeat", token, {})
+                last_heartbeat = now
+            except Exception as e:
+                log(f"[WARN] Heartbeat failed: {e}")
+
+        if now - last_range_push >= RANGE_PUSH_INTERVAL and any(v > 0 for v in range_nm):
+            try:
+                api_post("/api/ground/range", token, {"range_nm": range_nm})
+                last_range_push = now
+                log(f"[OK] Range updated (max {max(range_nm):.0f}nm)")
+            except Exception as e:
+                log(f"[WARN] Range push failed: {e}")
+
+        try:
+            aircraft_list = fetch_dump1090()
+        except Exception as e:
+            log(f"[WARN] dump1090 read failed: {e}")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        positions = {}
+        for ac in aircraft_list:
+            icao24 = ac.get("hex", "").lower()
+            if icao24 not in tracked:
+                continue
+            lat = ac.get("lat")
+            lon = ac.get("lon")
+            if lat is None or lon is None:
+                continue
+
+            gs       = ac.get("gs")
+            alt_baro = ac.get("alt_baro")
+            on_ground = ac.get("on_ground", False) or (alt_baro == "ground") or (gs is not None and gs < 50)
+            altitude  = field_elevation if on_ground else (float(alt_baro) if alt_baro and alt_baro != "ground" else field_elevation)
+            speed_kts = float(gs) if gs is not None else 0.0
+            heading   = float(ac.get("track") or 0)
+
+            positions[icao24] = {
+                "lat": lat, "lon": lon,
+                "altitude": altitude,
+                "speed": speed_kts,
+                "heading": heading,
+                "on_ground": on_ground,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+            if not on_ground:
+                dist    = haversine_distance(center_lat, center_lon, lat, lon)
+                bearing = haversine_bearing(center_lat, center_lon, lat, lon)
+                bucket  = int(bearing / 10) % 36
+                if dist > range_nm[bucket]:
+                    range_nm[bucket] = round(dist, 1)
+
+        if positions:
+            try:
+                api_post("/api/ground/positions", token, {"positions": positions})
+                parts = []
+                for icao, p in positions.items():
+                    tail = tracked[icao]
+                    loc  = "GND" if p["on_ground"] else f"{p['altitude']:.0f}ft"
+                    parts.append(f"{tail} {loc}")
+                log(f"[OK] {' | '.join(parts)}")
+            except Exception as e:
+                log(f"[WARN] Position push failed: {e}")
+        else:
+            log("No tracked aircraft in dump1090 feed")
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except KeyboardInterrupt:
+        log("Ground station stopped")
