@@ -523,18 +523,24 @@ class CloudAircraftTracker:
                                 and not state.get('on_ground', False)
                                 and not state.get('landed', False)
                                 and missing >= 2):
-                            # Check NotificationLog to avoid double-firing if GS already sent
-                            from models import NotificationLog
-                            _db = SessionLocal()
-                            try:
-                                recent = _db.query(NotificationLog).filter(
-                                    NotificationLog.user_id == user_id,
-                                    NotificationLog.aircraft_tail == tail,
-                                    NotificationLog.alert_type == 'landing',
-                                    NotificationLog.sent_at >= datetime.utcnow() - timedelta(minutes=5),
-                                ).first()
-                            finally:
-                                _db.close()
+                            # Team user IDs use "team:uuid" prefix which is incompatible with the
+                            # UUID-typed notification_logs.user_id column — skip dedup for teams
+                            # (team notifications are dispatched via _send_team_notifications_by_id
+                            # which has its own dedup logic and doesn't write to notification_logs)
+                            if user_id.startswith("team:"):
+                                recent = None
+                            else:
+                                from models import NotificationLog
+                                _db = SessionLocal()
+                                try:
+                                    recent = _db.query(NotificationLog).filter(
+                                        NotificationLog.user_id == user_id,
+                                        NotificationLog.aircraft_tail == tail,
+                                        NotificationLog.alert_type == 'landing',
+                                        NotificationLog.sent_at >= datetime.utcnow() - timedelta(minutes=5),
+                                    ).first()
+                                finally:
+                                    _db.close()
                             if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours() and not recent:
                                 notifications = [{
                                     'type': 'landing',

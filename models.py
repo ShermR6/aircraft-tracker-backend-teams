@@ -186,7 +186,7 @@ class Team(Base):
     members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
     channels = relationship("TeamChannel", back_populates="team", cascade="all, delete-orphan")
     aircraft = relationship("TeamAircraft", back_populates="team", cascade="all, delete-orphan")
-    airport_config = relationship("TeamAirportConfig", back_populates="team", uselist=False, cascade="all, delete-orphan")
+    airport_configs = relationship("TeamAirportConfig", back_populates="team", cascade="all, delete-orphan")
     alert_settings = relationship("TeamAlertSetting", back_populates="team", cascade="all, delete-orphan")
     invite_tokens = relationship("TeamInviteToken", back_populates="team", cascade="all, delete-orphan")
     roles = relationship("TeamRole", back_populates="team", cascade="all, delete-orphan")
@@ -245,7 +245,7 @@ class TeamAirportConfig(Base):
     __tablename__ = "team_airport_configs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False, unique=True)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
     airport_code = Column(String(10), nullable=True)
     airport_name = Column(String(255), nullable=True)
     latitude = Column(String(20), nullable=False)
@@ -266,7 +266,7 @@ class TeamAirportConfig(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    team = relationship("Team", back_populates="airport_config")
+    team = relationship("Team", back_populates="airport_configs")
 
 
 class TeamAlertSetting(Base):

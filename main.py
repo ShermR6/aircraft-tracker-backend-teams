@@ -2627,6 +2627,9 @@ async def startup_event():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_device_key VARCHAR(64)",
             # TeamAirportConfig — multi-airport support
             "ALTER TABLE team_airport_configs ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE",
+            # Drop the unique constraint on team_id so teams can have multiple airports
+            # The constraint name follows PostgreSQL's default naming: tablename_columnname_key
+            "ALTER TABLE team_airport_configs DROP CONSTRAINT IF EXISTS team_airport_configs_team_id_key",
             # New tables for teams v2
             """CREATE TABLE IF NOT EXISTS aircraft_claims (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
