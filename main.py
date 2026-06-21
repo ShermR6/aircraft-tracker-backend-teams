@@ -296,12 +296,16 @@ async def login(
     user = db.query(User).filter(User.email == email).first()
 
     # If no Railway account exists, auto-create a free-tier account
+    website_name = verified.get("name") or None
     if not user:
-        user = User(email=email)
+        user = User(email=email, display_name=website_name)
         db.add(user)
         db.commit()
         db.refresh(user)
         logger.info("Auto-created free account for %s", email)
+    elif website_name and user.display_name != website_name:
+        user.display_name = website_name
+        db.commit()
 
     # Step 3 — Get license info (may not exist for free accounts)
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
@@ -323,6 +327,7 @@ async def login(
         token_type="bearer",
         user_id=str(user.id),
         email=user.email,
+        display_name=user.display_name,
         license_tier=tier,
         expires_at=expires_at,
     )
@@ -369,12 +374,16 @@ async def google_desktop_login(
         raise HTTPException(status_code=401, detail="Invalid or expired OAuth token")
 
     user = db.query(User).filter(User.email == email).first()
+    google_name = verified.get("name") or None
     if not user:
-        user = User(email=email)
+        user = User(email=email, display_name=google_name)
         db.add(user)
         db.commit()
         db.refresh(user)
         logger.info("Auto-created account for Google OAuth user %s", email)
+    elif google_name and user.display_name != google_name:
+        user.display_name = google_name
+        db.commit()
 
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
     tier = "free"
@@ -391,6 +400,7 @@ async def google_desktop_login(
         token_type="bearer",
         user_id=str(user.id),
         email=user.email,
+        display_name=user.display_name,
         license_tier=tier,
         expires_at=expires_at,
     )
@@ -882,6 +892,7 @@ async def activate_license(
         token_type="bearer",
         user_id=str(user.id),
         email=user.email,
+        display_name=user.display_name,
         license_tier=license.tier,
         expires_at=license.expires_at
     )
@@ -2625,6 +2636,8 @@ async def startup_event():
             # Users — ground station columns
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_last_heartbeat TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_device_key VARCHAR(64)",
+            # Users — display name
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)",
             # TeamAirportConfig — multi-airport support
             "ALTER TABLE team_airport_configs ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE",
             # Drop the unique constraint on team_id so teams can have multiple airports
@@ -2791,6 +2804,7 @@ def _build_team_response(team: Team, db: Session) -> dict:
             "id": str(m.id),
             "user_id": str(m.user_id),
             "email": user.email if user else "",
+            "display_name": user.display_name if user else None,
             "role": m.role,
             "custom_role_id": str(m.custom_role_id) if m.custom_role_id else None,
             "custom_role_name": custom_role.name if custom_role else None,
@@ -3094,7 +3108,7 @@ async def activate_team_invite(
     invite.used_by_user_id = user.id
     db.commit()
     access_token = create_access_token(str(user.id))
-    return TokenResponse(access_token=access_token, token_type="bearer", user_id=str(user.id), email=user.email, license_tier=license.tier, expires_at=license.expires_at)
+    return TokenResponse(access_token=access_token, token_type="bearer", user_id=str(user.id), email=user.email, display_name=user.display_name, license_tier=license.tier, expires_at=license.expires_at)
 
 
 @app.get("/api/teams/roles")
