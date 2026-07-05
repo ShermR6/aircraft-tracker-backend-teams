@@ -2966,6 +2966,7 @@ async def add_team_channel(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_channels")
     channel = TeamChannel(
         team_id=team.id,
         integration_type=body.integration_type,
@@ -2992,6 +2993,7 @@ async def remove_team_channel(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_channels")
     channel = db.query(TeamChannel).filter(
         TeamChannel.id == channel_id,
         TeamChannel.team_id == team.id
@@ -3015,6 +3017,7 @@ async def update_team_routing(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_routing")
     team.routing = body.routing
     db.commit()
     return {"routing": team.routing}
@@ -3373,6 +3376,7 @@ async def add_team_aircraft(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_aircraft")
     tier = get_user_tier(current_user, db)
     limit = get_tier_limit(tier, "aircraft")
     if limit is not None:
@@ -3415,6 +3419,7 @@ async def update_team_aircraft(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_aircraft")
     aircraft = db.query(TeamAircraft).filter(
         TeamAircraft.id == aircraft_id,
         TeamAircraft.team_id == team.id,
@@ -3449,6 +3454,7 @@ async def delete_team_aircraft(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_aircraft")
     aircraft = db.query(TeamAircraft).filter(
         TeamAircraft.id == aircraft_id,
         TeamAircraft.team_id == team.id
@@ -3633,6 +3639,7 @@ async def save_team_alert_setting(
     db: Session = Depends(get_db)
 ):
     team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_alerts")
     existing = db.query(TeamAlertSetting).filter(
         TeamAlertSetting.team_id == team.id,
         TeamAlertSetting.alert_type == setting_data.alert_type
