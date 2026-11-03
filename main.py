@@ -325,7 +325,12 @@ async def login(
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{website_url}/api/auth/verify",
-                json={"email": credentials.email.lower(), "password": credentials.password},
+                # "product" scopes the entitlement the website returns: personal
+                # and teams are separate services with separate databases, so
+                # this one must only be told about team-* (and owner) licences.
+                json={"email": credentials.email.lower(),
+                      "password": credentials.password,
+                      "product": "teams"},
                 headers={"x-internal-secret": internal_secret},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
